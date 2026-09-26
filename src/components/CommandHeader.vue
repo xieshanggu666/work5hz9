@@ -62,6 +62,14 @@
         <span class="num" style="color:#4fc3f7">{{ warning.stats.abnormal }}/{{ warning.stats.stations }}</span>
         <span class="lab">监测异常</span>
       </div>
+      <div class="stat" :class="{ blocked: aid.stats.pending }">
+        <span class="num" style="color:#ffab40">{{ aid.stats.pending }}</span>
+        <span class="lab">互援待批</span>
+      </div>
+      <div class="stat" :class="{ blocked: aid.stats.executing }">
+        <span class="num" style="color:#f06292">{{ aid.stats.executing }}</span>
+        <span class="lab">互援调拨</span>
+      </div>
       <div class="stat" :class="{ blocked: roadblock.activeBlocks.length }">
         <span class="num" style="color:#ef5350">{{ roadblock.activeBlocks.length }}</span>
         <span class="lab">道路阻断</span>
@@ -120,6 +128,7 @@ import { useTransferStore } from '@/store/transfer'
 import { useRoadblockStore } from '@/store/roadblock'
 import { useRepairStore } from '@/store/repair'
 import { useWarningStore } from '@/store/warning'
+import { useAidStore } from '@/store/aid'
 import { useReplayStore } from '@/store/replay'
 import { SCENARIOS } from '@/mock/data'
 
@@ -128,6 +137,7 @@ const transfer = useTransferStore()
 const roadblock = useRoadblockStore()
 const repair = useRepairStore()
 const warning = useWarningStore()
+const aid = useAidStore()
 const replay = useReplayStore()
 const scenarios = SCENARIOS
 const now = ref('')
