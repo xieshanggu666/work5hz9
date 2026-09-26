@@ -1,0 +1,464 @@
+#!/usr/bin/env node
+// 推演网关：指挥员/前端唯一业务入口
+//  - 多人并行推演：会话(clientId) ↔ 推演(sim) ↔ 分支(branch)
+//  - 业务命令 → 领域事件（命令工厂前置校验 + 阻断联动编排）
+//  - 经事件采集服务写入（乱序缓冲/HLC/WAL），从回放服务读取最新态势
+//  - 真实调度隔离：真实流 'live' 只能经带外令牌的 /live/* 直连接口访问，推演命令一律拒绝
+import { createApp, ok, fail, listen, call, waitFor } from '../lib/http.js'
+import { PORTS, LIVE_SIM_ID, LIVE_WRITE_TOKEN } from '../lib/config.js'
+import {
+  buildCommand, scanImpacts, optionsFor, applyImpactEvents,
+  clearBlockRerouteEvents, resumeHeldEvents, buildFieldAction
+} from '../domain/commands.js'
+import { bedMap, dispatchParts } from '../domain/reducer.js'
+import { withGrade, gradeReason, CONFLICT_GRADES, REVIEW_DECISION_KINDS } from '../domain/conflicts.js'
+
+const app = createApp([
+  ['GET', '/healthz', async (req, res) => ok(res, { service: 'gateway' })],
+
+  /* ---------------- 推演会话管理 ---------------- */
+
+  // 创建推演（多人可随后加入同一会话，也可各自分叉）
+  ['POST', '/sims', async (req, res, params, query, body) => {
+    const r = await call('POST', PORTS.history, '/sims', {
+      id: body.id, name: body.name, scenarioId: body.scenarioId
+    })
+    if (r.status !== 200) return fail(res, r.status, r.body?.code || 'error', r.body?.msg || '创建失败')
+    const session = await ensureSession(body.clientId, r.body.sim.id, 'main')
+    ok(res, { sim: r.body.sim, clientId: session.clientId })
+  }],
+
+  ['GET', '/sims', async (req, res) => {
+    const r = await call('GET', PORTS.history, '/sims')
+    proxy(res, r)
+  }],
+
+  // 断线续演：用 clientId 拿回会话与分支位置
+  ['POST', '/sims/:simId/resume', async (req, res, { simId }, query, body) => {
+    if (simId === LIVE_SIM_ID) return fail(res, 403, 'live-protected', '真实调度流不接受推演续演')
+    const r = await call('POST', PORTS.history, `/sims/${encodeURIComponent(simId)}/resume`, { clientId: body.clientId })
+    if (r.status !== 200) return fail(res, r.status, r.body?.code, r.body?.msg)
+    const session = await ensureSession(body.clientId, simId, body.branchId || 'main')
+    // 带回当前末端态势，客户端可立即重绘
+    const st = await replayState(simId, body.branchId || 'main')
+    ok(res, { ...r.body, clientId: session.clientId, state: st?.state || null })
+  }],
+
+  // 分叉新分支（多人各自推演，原分支保留）
+  ['POST', '/sims/:simId/fork', async (req, res, { simId }, query, body) => {
+    if (simId === LIVE_SIM_ID) return fail(res, 403, 'live-protected', '真实调度流禁止分叉')
+    const r = await call('POST', PORTS.history, `/sims/${encodeURIComponent(simId)}/branches`, {
+      parentBranchId: body.parentBranchId || 'main', name: body.name, atSeq: body.atSeq
+    })
+    if (r.status !== 200) return fail(res, r.status, r.body?.code, r.body?.msg)
+    if (body.clientId) await ensureSession(body.clientId, simId, r.body.branch.id)
+    ok(res, { branch: r.body.branch, clientId: body.clientId || null })
+  }],
+
+  ['GET', '/sims/:simId/branches', async (req, res, { simId }) => {
+    const r = await call('GET', PORTS.history, `/sims/${encodeURIComponent(simId)}/branches`)
+    proxy(res, r)
+  }],
+
+  // 切换某客户端正在推演的分支
+  ['POST', '/sims/:simId/switch', async (req, res, { simId }, query, body) => {
+    if (!body.branchId) return fail(res, 400, 'need-branch', '缺少 branchId')
+    const session = await ensureSession(body.clientId, simId, body.branchId)
+    const st = await replayState(simId, body.branchId)
+    ok(res, { clientId: session.clientId, branchId: body.branchId, state: st?.state || null })
+  }],
+
+  /* ---------------- 读态势（回放服务投影） ---------------- */
+
+  ['GET', '/sims/:simId/state', async (req, res, { simId }, { branch, atSeq }) => {
+    const r = await call('GET', PORTS.replay,
+      `/sims/${encodeURIComponent(simId)}/branches/${encodeURIComponent(branch || 'main')}/replay${atSeq != null ? `?atSeq=${atSeq}` : ''}`)
+    proxy(res, r)
+  }],
+  ['GET', '/sims/:simId/timeline', async (req, res, { simId }, { branch }) => {
+    const r = await call('GET', PORTS.replay, `/sims/${encodeURIComponent(simId)}/branches/${encodeURIComponent(branch || 'main')}/timeline`)
+    proxy(res, r)
+  }],
+  ['GET', '/sims/:simId/diff', async (req, res, { simId }, { branch, atSeq }) => {
+    const r = await call('GET', PORTS.replay,
+      `/sims/${encodeURIComponent(simId)}/branches/${encodeURIComponent(branch || 'main')}/diff${atSeq != null ? `?atSeq=${atSeq}` : ''}`)
+    proxy(res, r)
+  }],
+  ['GET', '/sims/:simId/compare', async (req, res, { simId }, { a, b }) => {
+    const r = await call('GET', PORTS.replay,
+      `/sims/${encodeURIComponent(simId)}/compare?a=${encodeURIComponent(a || 'main')}&b=${encodeURIComponent(b || '')}`)
+    proxy(res, r)
+  }],
+  ['GET', '/sims/:simId/poll', async (req, res, { simId }, { branch, afterSeq }) => {
+    const r = await call('GET', PORTS.replay,
+      `/sims/${encodeURIComponent(simId)}/branches/${encodeURIComponent(branch || 'main')}/poll?afterSeq=${encodeURIComponent(afterSeq ?? '-1')}`)
+    proxy(res, r)
+  }],
+
+  /* ---------------- 阻断影响评估 / 处置编排 ---------------- */
+
+  ['POST', '/sims/:simId/blocks/:blockId/assess', async (req, res, { simId, blockId }, { branch }, body) => {
+    const branchId = body.branchId || branch || 'main'
+    const st = await replayState(simId, branchId)
+    if (!st) return fail(res, 404, 'no-state', '态势不可用')
+    const impacts = scanImpacts(st.state, blockId)
+    const withOptions = impacts.map((i) => ({ ...i, options: optionsFor(st.state, blockId, i.kind, i.id) }))
+    ok(res, { blockId, impacts: withOptions })
+  }],
+
+  // 执行单个处置（执行前按最新态势复核；自动降级 detour→reassign→suspend）
+  ['POST', '/sims/:simId/blocks/:blockId/apply', async (req, res, { simId, blockId }, { branch }, body) => {
+    const branchId = body.branchId || branch || 'main'
+    const { kind, id, action, baseId, shelterId, clientId } = body
+    if (!['dispatch', 'batch'].includes(kind)) return fail(res, 400, 'bad-kind', 'kind 必须是 dispatch / batch')
+    const st = await replayState(simId, branchId)
+    if (!st) return fail(res, 404, 'no-state', '态势不可用')
+    const built = applyImpactEvents(st.state, blockId, kind, id, { action, baseId, shelterId })
+    if (!built.ok) return fail(res, built.status || 409, 'no-plan', built.msg)
+    const pushed = await pushEvents(simId, branchId, built.events, { clientId, at: body.at })
+    if (!pushed.ok) return fail(res, pushed.status, pushed.code, pushed.msg)
+    ok(res, { applied: built.plan, adjusted: built.adjusted, ...pushed.body })
+  }],
+
+  // 恢复通行：清除阻断 + 剩余生效阻断视角下联合重排路线 + 工单联动
+  ['POST', '/sims/:simId/blocks/:blockId/clear', async (req, res, { simId, blockId }, { branch }, body) => {
+    const branchId = body.branchId || branch || 'main'
+    const st = await replayState(simId, branchId)
+    if (!st) return fail(res, 404, 'no-state', '态势不可用')
+    const built = clearBlockRerouteEvents(st.state, blockId)
+    const pushed = await pushEvents(simId, branchId, built.events, { clientId: body.clientId, at: body.at })
+    if (!pushed.ok) return fail(res, pushed.status, pushed.code, pushed.msg)
+    ok(res, { rerouted: built.events.length - 1, ...pushed.body })
+  }],
+
+  // 一键续派挂起任务（路线与库存复核）
+  ['POST', '/sims/:simId/resume-held', async (req, res, { simId }, { branch }, body) => {
+    const branchId = body.branchId || branch || 'main'
+    const st = await replayState(simId, branchId)
+    if (!st) return fail(res, 404, 'no-state', '态势不可用')
+    const built = resumeHeldEvents(st.state)
+    const pushed = await pushEvents(simId, branchId, built.events, { clientId: body.clientId, at: body.at })
+    if (!pushed.ok) return fail(res, pushed.status, pushed.code, pushed.msg)
+    ok(res, { resumed: built.events.length, keptHeld: built.kept, ...pushed.body })
+  }],
+
+  /* ---------------- 通用业务命令入口 ---------------- */
+
+  ['POST', '/sims/:simId/commands/:command', async (req, res, { simId, command }, { branch }, body) => {
+    if (simId === LIVE_SIM_ID) {
+      return fail(res, 403, 'live-protected',
+        '推演命令不得写入真实调度流；真实操作请使用带 X-Live-Token 的 /live/commands 通道')
+    }
+    const branchId = body.branchId || branch || 'main'
+    const st = await replayState(simId, branchId)
+    if (!st) return fail(res, 404, 'no-state', '推演态势不可用，请先确认会话')
+    const built = buildCommand(st.state, command, body)
+    if (!built.ok) return fail(res, built.status || 400, 'command-rejected', built.msg)
+    const pushed = await pushEvents(simId, branchId, built.events, { clientId: body.clientId, at: body.at, day: body.day })
+    if (!pushed.ok) return fail(res, pushed.status, pushed.code, pushed.msg)
+    ok(res, { command, events: pushed.body.events, seq: pushed.body.seq, conflicts: pushed.body.conflicts })
+  }],
+
+  /* ---------------- 移动端现场协同（离线接收预警 / 联网补传） ---------------- */
+
+  // 现场端离线包：当前态势精简 + 生效预警（按队伍待签收过滤），供断网前缓存
+  ['GET', '/sims/:simId/field/bundle', async (req, res, { simId }, { branch, teamId }) => {
+    const branchId = branch || 'main'
+    const st = await replayState(simId, branchId)
+    if (!st) return fail(res, 404, 'no-state', '态势不可用')
+    const s = st.state
+    const warnings = s.warnings
+      .filter((w) => ['active', 'responded'].includes(w.status))
+      .map((w) => ({
+        id: w.id, title: w.title, level: w.level, source: w.source,
+        eventId: w.eventId, issuedAt: w.issuedAt, targets: w.targets,
+        acks: w.acks, status: w.status,
+        // 该队伍视角的待签收角色（升级补发后需要重新签收）
+        pendingRoles: w.targets.filter((r) => !w.acks[r])
+      }))
+    ok(res, {
+      atSeq: st.atSeq, branchId,
+      bundle: {
+        serverAt: Date.now(),
+        warnings,
+        // 与本队伍相关的在途任务（签收物资 / 抢修工单），离线期间可直接操作
+        dispatches: s.dispatches
+          .filter((d) => !['done', 'withdrawn'].includes(d.status))
+          .map((d) => ({ id: d.id, type: d.type, typeLabel: d.typeLabel, qty: d.qty, unit: d.unit, status: d.status, baseName: d.baseName, dest: d.eventTitle || d.shelterName, outstanding: dispatchParts(d).outstanding })),
+        orders: s.orders
+          .filter((o) => ['dispatched', 'accepted', 'done'].includes(o.status))
+          .map((o) => ({ id: o.id, blockId: o.blockId, blockName: o.blockName, status: o.status, progress: o.progress, deadline: o.deadline })),
+        blocks: s.blocks.filter((b) => b.status === 'active').map((b) => ({ id: b.id, name: b.name })),
+        events: s.events.map((e) => ({ id: e.id, title: e.title, severity: e.severity, status: e.status })),
+        teams: s.teams.map((t) => ({ id: t.id, name: t.name, position: t.position })),
+        // 指挥端审核回写：本分支上针对本队伍冲突动作的审核结论（现场队列据此同步）
+        reviews: (s.conflictReviews || []).filter((rv) => !teamId || rv.teamId === teamId).slice(-50)
+      },
+      mine: teamId ? warnings.filter((w) => w.targets.includes('field') || w.targets.includes(teamId)).length : null
+    })
+  }],
+
+  // 联网补传：现场离线动作按因果顺序逐条应用；每条独立回执，冲突不阻塞后续动作
+  ['POST', '/sims/:simId/field/actions', async (req, res, { simId }, { branch }, body) => {
+    if (simId === LIVE_SIM_ID) return fail(res, 403, 'live-protected', '现场动作不得直写真实流')
+    const branchId = body.branchId || branch || 'main'
+    const actions = Array.isArray(body.actions) ? body.actions : [body.action]
+    if (!actions.length) return fail(res, 400, 'empty-actions', '缺少现场动作')
+    // 分支尚不存在（现场离线切到了未分叉的分支）：整批 404，让现场端把动作
+    // 保留 queued 推迟补传，而不是把每条都误记成冲突
+    const probe = await replayState(simId, branchId, true)
+    if (!probe) return fail(res, 404, 'branch-not-found', `分支 ${branchId} 尚不存在，动作保留待分支就绪后补传`)
+    const results = []
+    for (const action of actions) {
+      const aid = action.clientActionId
+      // 逐条动作读取最新态势：前一动作引发的路线/库存变化立即对后续动作可见
+      // eslint-disable-next-line no-await-in-loop
+      const st = await replayState(simId, branchId, true)
+      if (!st) { results.push(withGrade({ clientActionId: aid, ok: false, code: 'no-state', msg: '态势不可用' })); continue }
+      const conflictsBefore = (st.state.conflicts || []).length
+      const built = buildFieldAction(st.state, action)
+      if (!built.ok) { results.push(withGrade({ clientActionId: aid, ok: false, code: built.code || 'rejected', status: built.status, msg: built.msg, ...(built.meta || {}) })); continue }
+      // 复合事件（如道路封闭→自动绕行）用稳定 id 前缀，保证重试幂等；
+      // 冲突重提（retry）派生过 attemptId 的以它为前缀，避免与已入账事件 id 碰撞
+      // eslint-disable-next-line no-await-in-loop
+      const pushed = await pushEvents(simId, branchId, built.events, {
+        clientId: body.clientId || action.teamId, at: action.at, day: action.day,
+        idPrefix: action.attemptId || aid, hlc: action.hlc
+      })
+      if (!pushed.ok) { results.push(withGrade({ clientActionId: aid, ok: false, code: pushed.code, msg: pushed.msg })); continue }
+      // reducer 层冲突（并发竞态/因果乱序）：事件幂等入账但业务前置未满足。
+      // conflicts 为追加账，取本动作新增的切片判定
+      const newConflicts = (pushed.body.conflicts || []).slice(conflictsBefore)
+      const applied = newConflicts.length === 0
+      results.push({
+        clientActionId: aid, ok: true,
+        events: pushed.body.events, seq: pushed.body.seq,
+        conflicts: pushed.body.conflicts,
+        applied,
+        meta: built.meta || {},
+        // 复合动作内部冲突（如自动绕行在执行瞬间失效）提示现场/指挥员
+        advisory: newConflicts.map((c) => c.reason),
+        ...(applied ? {} : withGrade({ ok: true, applied: false, advisory: newConflicts.map((c) => c.reason) }))
+      })
+    }
+    ok(res, { results, branchId })
+  }],
+
+  /* ---------------- 指挥端 · 现场冲突处置闭环（分级 / 审核回写） ---------------- */
+
+  // 冲突工作台：现场队列冲突（带原因分级）+ 本分支 reducer 冲突账（含审核标记）
+  ['GET', '/sims/:simId/field/conflicts', async (req, res, { simId }, { branch, teamId }) => {
+    const branchId = branch || 'main'
+    const q = await call('GET', PORTS.field, `/sims/${encodeURIComponent(simId)}/field-conflicts`)
+      .catch((e) => ({ status: 502, body: { code: 'field-down', msg: e.message } }))
+    if (q.status !== 200) return fail(res, q.status, q.body?.code || 'field-down', q.body?.msg || '现场同步服务不可达')
+    let queue = q.body.conflicts || []
+    if (teamId) queue = queue.filter((a) => a.teamId === teamId)
+    // reducer 冲突账（并发竞态留痕，含指挥端审核标记），按 clientActionId 前缀关联队列动作
+    const st = await replayState(simId, branchId)
+    const ledger = (st?.state?.conflicts || []).map((c) => ({
+      ...c,
+      clientActionId: String(c.eventId || '').split('#')[0] || null,
+      grade: gradeReason(c.reason),
+      gradeLabel: CONFLICT_GRADES[gradeReason(c.reason)]?.label
+    }))
+    ok(res, { branchId, queue, ledger, grades: CONFLICT_GRADES })
+  }],
+
+  // 指挥端审核：结论三面回写——
+  //   ① 队列：经现场服务更新动作（retry 回原分支 / redirect 改投 / close 办结 / note 批注）
+  //   ② 事件时间线：field.conflictReviewed 事件写入动作原分支，关联灾情事件留痕
+  //   ③ 分支复盘：审核入 conflictReviews 并标记冲突账，回放/seek/分叉对照均可还原
+  ['POST', '/sims/:simId/field/conflicts/review', async (req, res, { simId }, query, body) => {
+    if (simId === LIVE_SIM_ID) return fail(res, 403, 'live-protected', '真实调度流不接受推演审核')
+    const { teamId, clientActionId, decision, note = '', by = '指挥端', targetBranchId, patch = {} } = body || {}
+    if (!teamId || !clientActionId) return fail(res, 400, 'bad-review', '缺少 teamId / clientActionId')
+    if (!REVIEW_DECISION_KINDS.includes(decision)) {
+      return fail(res, 400, 'bad-decision', `decision 必须是 ${REVIEW_DECISION_KINDS.join('/')}`)
+    }
+    // 1) 定位动作（现场队列，跨分支按 id 查找）；找不到时可能已被改投——
+    //    直接转现场服务按 movedFrom 溯源（重复审核幂等，不重复改投、不重复记事件）
+    const found = await call('GET', PORTS.field,
+      `/sims/${encodeURIComponent(simId)}/teams/${encodeURIComponent(teamId)}/actions/${encodeURIComponent(clientActionId)}`)
+      .catch((e) => ({ status: 502, body: { code: 'field-down', msg: e.message } }))
+    if (found.status === 502) return fail(res, 502, 'field-down', found.body?.msg || '现场同步服务不可达')
+    if (found.status !== 200) {
+      const qr0 = await call('POST', PORTS.field,
+        `/sims/${encodeURIComponent(simId)}/teams/${encodeURIComponent(teamId)}/actions/${encodeURIComponent(clientActionId)}/review`,
+        { decision, note, by, targetBranchId, patch, sync: false })
+        .catch((e) => ({ status: 502, body: { code: 'field-down', msg: e.message } }))
+      if (qr0.status === 200 && qr0.body?.alreadyApplied) {
+        return ok(res, { reviewed: true, alreadyApplied: true, decision, queue: { action: qr0.body.action } })
+      }
+      return fail(res, found.status, found.body?.code || 'action-not-found', found.body?.msg || '动作不存在')
+    }
+    const action = found.body.action
+    const branchId = action.branchId || 'main'
+    // 改投目标分支必须已存在（未分叉的分支不能接收改投）
+    if (decision === 'redirect') {
+      if (!targetBranchId) return fail(res, 400, 'need-branch', 'redirect 需要 targetBranchId')
+      const probe = await replayState(simId, targetBranchId, true)
+      if (!probe) return fail(res, 404, 'branch-not-found', `目标分支 ${targetBranchId} 尚不存在，无法改投`)
+    }
+    // 2) 队列回写（先落队列，事件里才能带上改投生成的新动作 id）
+    const qr = await call('POST', PORTS.field,
+      `/sims/${encodeURIComponent(simId)}/teams/${encodeURIComponent(teamId)}/actions/${encodeURIComponent(clientActionId)}/review`,
+      { decision, note, by, targetBranchId, patch, sync: true })
+      .catch((e) => ({ status: 502, body: { code: 'field-down', msg: e.message } }))
+    if (qr.status !== 200) return fail(res, qr.status, qr.body?.code || 'review-failed', qr.body?.msg || '队列回写失败')
+    const queueAction = qr.body.action
+    // 3) 领域事件：审核结论写入动作原分支（确定性 id：同动作第 n 次审核，重试幂等）
+    const st = await replayState(simId, branchId, true)
+    if (!st) return fail(res, 502, 'no-state', '态势不可用，审核事件未写入（队列已回写）')
+    const prior = (st.state.conflictReviews || []).filter((rv) => rv.clientActionId === clientActionId).length
+    const reviewEvent = {
+      type: 'field.conflictReviewed',
+      payload: {
+        clientActionId, teamId, kind: action.kind, branchId,
+        decision, note, by,
+        grade: queueAction?.result?.grade || null,
+        reason: action.result?.msg || null,
+        targetBranchId: decision === 'redirect' ? targetBranchId : null,
+        newClientActionId: decision === 'redirect' ? (queueAction?.clientActionId || null) : null,
+        eventId: resolveReviewEventId(st.state, action)
+      }
+    }
+    const pushed = await pushEvents(simId, branchId, [reviewEvent], {
+      clientId: by, at: body.at, idPrefix: `review-${clientActionId}#${prior}`
+    })
+    if (!pushed.ok) {
+      return fail(res, pushed.status || 502, pushed.code || 'review-event-failed',
+        `审核事件写入失败（队列已回写）：${pushed.msg || ''}`, { queueUpdated: true })
+    }
+    ok(res, {
+      reviewed: true, decision, branchId,
+      review: reviewEvent.payload,
+      queue: { action: queueAction, sync: qr.body.sync || null },
+      seq: pushed.body.seq,
+      conflicts: pushed.body.conflicts
+    })
+  }],
+
+  /* ---------------- 真实调度（生产流）：独立通道 + 带外令牌 + 与推演隔离 ---------------- */
+
+  ['POST', '/live/commands/:command', async (req, res, params, query, body) => {
+    if (!LIVE_WRITE_TOKEN) return fail(res, 403, 'token-disabled', '未配置 LIVE_WRITE_TOKEN，真实流写入关闭（演练安全模式）')
+    if (req.headers['x-live-token'] !== LIVE_WRITE_TOKEN) return fail(res, 401, 'bad-token', '真实调度写入令牌无效')
+    // 确保 live 流已按场景初始化（带令牌经历史服务建立，独立于所有推演分支）
+    await ensureLive(req, body.scenarioId)
+    // 初始化后回放服务可能短暂未感知新流：强制刷新并短暂重试
+    let st = await replayState(LIVE_SIM_ID, 'main', true)
+    for (let i = 0; i < 8 && !st; i++) {
+      await new Promise((r) => setTimeout(r, 120))
+      st = await replayState(LIVE_SIM_ID, 'main', true)
+    }
+    if (!st) return fail(res, 502, 'no-live-state', '真实流态势不可用')
+    const built = buildCommand(st.state, params.command, body)
+    if (!built.ok) return fail(res, built.status || 400, 'command-rejected', built.msg)
+    // 直写历史服务的 /live/events（绕过采集缓冲，带令牌），不经任何推演分支
+    const resp = await call('POST', PORTS.history, '/live/events', {
+      branchId: 'main', events: withChain(built.events, body.at, body.day)
+    }, { 'x-live-token': LIVE_WRITE_TOKEN })
+    if (resp.status !== 200) return fail(res, resp.status, resp.body?.code, resp.body?.msg)
+    ok(res, { command: params.command, seq: resp.body.seq, conflicts: resp.body.conflicts, live: true })
+  }],
+  ['GET', '/live/state', async (req, res) => {
+    const r = await call('GET', PORTS.replay, `/sims/${LIVE_SIM_ID}/branches/main/replay`)
+    proxy(res, r)
+  }]
+])
+
+/* ---------------- 辅助 ---------------- */
+
+// 解析现场动作关联的灾情事件（审核结论回写事件时间线用）：
+// 物资签收 → 派发去向事件；预警签收 → 预警关联事件；其余动作无直接关联
+function resolveReviewEventId(state, action) {
+  if (!state || !action) return null
+  if (action.kind === 'signDispatch' && action.dispatchId) {
+    return state.dispatches.find((d) => d.id === action.dispatchId)?.eventId || null
+  }
+  if (action.kind === 'ackWarning' && action.warningId) {
+    return state.warnings.find((w) => w.id === action.warningId)?.eventId || null
+  }
+  return null
+}
+
+function proxy(res, r) {
+  res.writeHead(r.status, { 'content-type': 'application/json; charset=utf-8' })
+  res.end(JSON.stringify(r.body))
+}
+
+async function replayState(simId, branchId, refresh = false) {
+  const q = refresh ? '?refresh=1' : ''
+  const r = await call('GET', PORTS.replay, `/sims/${encodeURIComponent(simId)}/branches/${encodeURIComponent(branchId)}/replay${q}`)
+  if (r.status !== 200) return null
+  return r.body
+}
+
+async function ensureSession(clientId, simId, branchId) {
+  if (!clientId) return { clientId: null }
+  const r = await call('POST', PORTS.ingestion, '/sessions', { clientId, simId, branchId })
+  if (r.status === 200) return r.body
+  return { clientId }
+}
+
+async function ensureLive(req, scenarioId) {
+  const headers = {}
+  if (req.headers['x-live-token']) headers['x-live-token'] = req.headers['x-live-token']
+  const exist = await call('GET', PORTS.history, '/live')
+  if (exist.status !== 200) {
+    const init = await call('POST', PORTS.history, '/live/init', { scenarioId: scenarioId || 's1' }, headers)
+    if (init.status !== 200) throw new Error('真实流初始化失败：' + (init.body?.msg || init.status))
+  }
+}
+
+// 同批多事件串 after 链，保证编排事件（如清除阻断→路线重排→工单办结）按因果顺序应用。
+// 事件 id 在采集端允许显式指定；idPrefix 提供确定性幂等 id（现场补传重试去重），
+// 否则生成稳定临时 id（非业务 payload id，避免幂等碰撞）。
+function withChain(events, at, day, { idPrefix, hlc } = {}) {
+  let prevId = null
+  return events.map((e, i) => {
+    const id = idPrefix
+      ? `${idPrefix}#${i}`
+      : `cmd-${Date.now().toString(36)}-${i}-${Math.random().toString(36).slice(2, 7)}`
+    const out = { ...e, id, after: prevId ? [prevId] : (e.after || []) }
+    if (at && !out.at) out.at = at
+    if (day != null && out.day == null) out.day = day
+    // 现场离线动作携带客户端 HLC：补传时按真实发生时间归位，而非补传时刻
+    if (hlc && i === 0 && !out.hlc) out.hlc = hlc
+    prevId = id
+    return out
+  })
+}
+
+// 推送一批领域事件：经采集服务（乱序缓冲 + WAL），随后强制冲刷并回读确认
+async function pushEvents(simId, branchId, events, { clientId, at, day, idPrefix, hlc } = {}) {
+  const payload = { clientId, events: withChain(events, at, day, { idPrefix, hlc }) }
+  const r = await call('POST', PORTS.ingestion,
+    `/sims/${encodeURIComponent(simId)}/branches/${encodeURIComponent(branchId)}/events`, payload)
+  if (r.status !== 200) return { ok: false, status: r.status, code: r.body?.code, msg: r.body?.msg }
+  // 立即冲刷乱序窗口，保证命令返回时事件已落历史日志
+  const f = await call('POST', PORTS.ingestion, '/flush', { simId, branchId })
+  if (f.status !== 200) return { ok: false, status: 502, code: 'flush-failed', msg: '采集冲刷失败' }
+  // 回读确认末端 seq
+  const h = await call('GET', PORTS.history, `/sims/${encodeURIComponent(simId)}/branches/${encodeURIComponent(branchId)}/events?afterSeq=-1`)
+  if (h.status !== 200) return { ok: false, status: 502, code: 'history-unavailable', msg: h.body?.msg || '' }
+  const last = h.body.events[h.body.events.length - 1]
+  // 回读折叠后的冲突账（并发竞态最终守恒）
+  const st = await replayState(simId, branchId, true)
+  return {
+    ok: true,
+    body: {
+      seq: h.body.seq,
+      events: r.body.events,
+      conflicts: st?.state?.conflicts || []
+    }
+  }
+}
+
+Promise.all([
+  waitFor(PORTS.ingestion, '/healthz', 100, 200).catch(() => null),
+  waitFor(PORTS.history, '/healthz', 100, 200).catch(() => null),
+  waitFor(PORTS.replay, '/healthz', 100, 200).catch(() => null)
+]).then(() => listen(app, PORTS.gateway, 'gateway'))
+  .catch((e) => { console.error(e); process.exit(1) })
