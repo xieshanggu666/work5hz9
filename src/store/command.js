@@ -80,7 +80,8 @@ const MOVEMENT_META = {
   repair: { icon: '🔧', label: '抢修派工扣减' },
   repairBack: { icon: '🔧', label: '抢修结算归还' },
   vehicle: { icon: '🚌', label: '转移车辆占用' },
-  vehicleBack: { icon: '🚌', label: '车辆回收' }
+  vehicleBack: { icon: '🚌', label: '车辆回收' },
+  aid: { icon: '🤝', label: '互援调拨出库' }
 }
 
 export const useCommandStore = defineStore('command', {
@@ -422,7 +423,8 @@ export const useCommandStore = defineStore('command', {
         signedQty: 0, shortQty: 0, shortReplenished: 0, returnedQty: 0, withdrawnQty: 0,
         signLogs: [], returnLogs: [], withdrawLogs: [], replenishOf: null
       }
-      this._moveStock(baseId, type, -qty, source === '短缺补派' || source === '补给补派' ? 'replenish' : 'dispatch',
+      this._moveStock(baseId, type, -qty,
+        source === '短缺补派' || source === '补给补派' ? 'replenish' : source === '互援调拨' ? 'aid' : 'dispatch',
         { eventId, dispatchId: record.id })
       this.dispatches.unshift(record)
       ev.timeline.push({ at: record.at, text: `${source}派发 ${record.typeLabel} ${qty}${record.unit}👈${base.name}` })

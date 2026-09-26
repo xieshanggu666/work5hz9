@@ -18,6 +18,9 @@
       <button :class="{ active: tab === 'warning' }" @click="tab = 'warning'">
         🚨 实时预警<span v-if="warning.activeAlerts.length" class="badge red">{{ warning.activeAlerts.length }}</span>
       </button>
+      <button :class="{ active: tab === 'aid' }" @click="tab = 'aid'">
+        🤝 跨区互援<span v-if="aid.stats.pending" class="badge indigo">{{ aid.stats.pending }}</span>
+      </button>
     </div>
 
     <template v-if="tab === 'single'">
@@ -100,7 +103,7 @@
             {{ d.doneReason === 'returned' ? '↩️ 已退库' : d.doneReason === 'short' ? '⚠ 含短缺办结' : '✅ 已签收' }}
           </span>
           <span v-else-if="d.via && d.via.length" class="di-detour">🔀 绕行</span>
-          <span v-if="d.source" class="di-src" :class="{ plan: (d.source || '').includes('统筹'), replenish: (d.source || '').includes('补派') }">{{ d.source }}</span>
+          <span v-if="d.source" class="di-src" :class="{ plan: (d.source || '').includes('统筹'), replenish: (d.source || '').includes('补派'), aid: (d.source || '').includes('互援') }">{{ d.source }}</span>
           <span class="di-qty">
             <em>{{ partsOf(d).received }}/{{ d.qty }}{{ d.unit }}</em>
             <i v-if="partsOf(d).inTransit > 0" class="q-transit">在途 {{ partsOf(d).inTransit }}</i>
@@ -192,6 +195,9 @@
 
     <!-- 实时预警协同 -->
     <WarningPanel v-else-if="tab === 'warning'" />
+
+    <!-- 跨区域互援协同 -->
+    <AidPanel v-else-if="tab === 'aid'" />
   </div>
 </template>
 
@@ -202,18 +208,21 @@ import { useTransferStore } from '@/store/transfer'
 import { useRoadblockStore } from '@/store/roadblock'
 import { useRepairStore } from '@/store/repair'
 import { useWarningStore } from '@/store/warning'
+import { useAidStore } from '@/store/aid'
 import { RESOURCE_TYPES } from '@/mock/data'
 import PlanPanel from '@/components/PlanPanel.vue'
 import TransferPanel from '@/components/TransferPanel.vue'
 import RoadBlockPanel from '@/components/RoadBlockPanel.vue'
 import RepairPanel from '@/components/RepairPanel.vue'
 import WarningPanel from '@/components/WarningPanel.vue'
+import AidPanel from '@/components/AidPanel.vue'
 
 const store = useCommandStore()
 const transfer = useTransferStore()
 const roadblock = useRoadblockStore()
 const repair = useRepairStore()
 const warning = useWarningStore()
+const aid = useAidStore()
 const tab = ref('single')
 const form = ref({ baseId: '', type: 'personnel', qty: 0 })
 
@@ -327,6 +336,10 @@ watch(() => repair.focusOrderId, (id) => {
 watch(() => warning.focusAlertId, (id) => {
   if (id) tab.value = 'warning'
 })
+// 新互援请求提交 → 自动跳到跨区互援页签
+watch(() => aid.focusRequestId, (id) => {
+  if (id) tab.value = 'aid'
+})
 watch(selectedEvent, (ev) => {
   if (ev) {
     // 默认选择距受灾点最近的基地
@@ -366,6 +379,7 @@ watch(selectedEvent, (ev) => {
 .badge.teal { background: #26a69a; }
 .badge.red { background: #ef5350; }
 .badge.orange { background: #ff9800; }
+.badge.indigo { background: #7986cb; }
 .panel-sub {
   font-size: 12px; color: #6f8cb8; font-weight: 600;
   border-left: 3px solid #4d8dff; padding-left: 8px; margin: 6px 0;
@@ -447,6 +461,7 @@ watch(selectedEvent, (ev) => {
 }
 .di-src.plan { background: rgba(156,77,255,0.2); color: #ce93ff; }
 .di-src.replenish { background: rgba(255,152,0,0.18); color: #ffcc80; }
+.di-src.aid { background: rgba(121,134,203,0.22); color: #c5cae9; }
 .di-held {
   font-size: 9px; padding: 1px 5px; border-radius: 4px;
   background: rgba(255,193,7,0.18); color: #ffd54f;

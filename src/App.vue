@@ -42,6 +42,7 @@ import { useTransferStore } from '@/store/transfer'
 import { useRoadblockStore } from '@/store/roadblock'
 import { useRepairStore } from '@/store/repair'
 import { useWarningStore } from '@/store/warning'
+import { useAidStore } from '@/store/aid'
 import { useReplayStore, installReplayRecorder } from '@/store/replay'
 import CommandHeader from '@/components/CommandHeader.vue'
 import EventList from '@/components/EventList.vue'
@@ -55,23 +56,26 @@ const transfer = useTransferStore()
 const roadblock = useRoadblockStore()
 const repair = useRepairStore()
 const warning = useWarningStore()
+const aid = useAidStore()
 const replay = useReplayStore()
 
-// 五 store 就绪后安装复盘录制器（包装业务 action：录制 + 回放锁定），再载入场景
+// 六 store 就绪后安装复盘录制器（包装业务 action：录制 + 回放锁定），再载入场景
 installReplayRecorder()
 onMounted(() => {
   store.loadScenario(store.scenarioId)
   transfer.load()
   repair.load()
   warning.load()
+  aid.load()
   replay.begin()
 })
-// 切换灾情场景时重置转移安置、道路阻断、抢修工单与预警数据，并以新场景为基线重新录制
+// 切换灾情场景时重置转移安置、道路阻断、抢修工单、预警与互援数据，并以新场景为基线重新录制
 watch(() => store.scenarioId, () => {
   transfer.load()
   roadblock.load()
   repair.load()
   warning.load()
+  aid.load()
   if (replay.active) nextTick(() => replay.begin())
 }, { flush: 'sync' })
 </script>

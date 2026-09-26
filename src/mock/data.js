@@ -101,6 +101,27 @@ export const FEED_METRICS = {
   microseism: { label: '微震频次', unit: '次/h', icon: '📳', kind: 'geo' }
 }
 
+/* ---------- 跨区域互援协同 ---------- */
+
+// 外部支援队伍（兄弟市县 / 省级增援 / 社会力量；经联动平台提交资源请求）
+export const AID_TEAMS = [
+  { id: 'at-1', name: '德阳市消防救援支队', region: '德阳市', contact: '李队长', channel: '省应急联动平台' },
+  { id: 'at-2', name: '遂宁市应急抢险队', region: '遂宁市', contact: '王队长', channel: '省应急联动平台' },
+  { id: 'at-3', name: '省军区应急救援营', region: '省军区', contact: '张营长', channel: '军队联合指挥网' },
+  { id: 'at-4', name: '广元蓝天救援队', region: '广元市', contact: '赵领队', channel: '社会应急力量协调系统' }
+]
+
+// 互援请求状态机：待审批 → 待调拨（指挥员核定配额）/ 已驳回 → 调拨在途 → 已回执（办结）
+// 出库前请求方可撤销（已撤销，终态）；全部终态操作幂等拦截
+export const AID_STATUS = [
+  { value: 'requested', label: '待审批', color: '#ffab40' },
+  { value: 'approved', label: '待调拨', color: '#4fc3f7' },
+  { value: 'delivering', label: '调拨在途', color: '#2f9cf5' },
+  { value: 'received', label: '已回执', color: '#4caf50' },
+  { value: 'rejected', label: '已驳回', color: '#9e9e9e' },
+  { value: 'cancelled', label: '已撤销', color: '#78909c' }
+]
+
 // 安置点（床位容量）
 export const SHELTERS = [
   { id: 'sh-1', name: '江油一中临时安置点', lng: 104.7705, lat: 31.778, capacity: 1200 },

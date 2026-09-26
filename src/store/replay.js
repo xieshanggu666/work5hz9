@@ -4,15 +4,16 @@ import { useTransferStore } from '@/store/transfer'
 import { useRoadblockStore } from '@/store/roadblock'
 import { useRepairStore } from '@/store/repair'
 import { useWarningStore } from '@/store/warning'
+import { useAidStore } from '@/store/aid'
 import {
-  RESOURCE_TYPES, EVENT_TYPES, EVENT_STATUS, TRANSFER_STATUS, REPAIR_STATUS, SEVERITY, ALERT_STATUS
+  RESOURCE_TYPES, EVENT_TYPES, EVENT_STATUS, TRANSFER_STATUS, REPAIR_STATUS, SEVERITY, ALERT_STATUS, AID_STATUS
 } from '@/mock/data'
 
 /* =========================================================================
  * 历史复盘模块（事件溯源 · 多分支演练）
  *
- * 录制：包装五个业务 store 的 action，每个成功改变状态的「最外层动作」沉淀一帧——
- *       全量状态快照（事件/派发/转移/阻断/抢修/预警/库存）+ 动作元数据 + 当帧新增处置日志。
+ * 录制：包装六个业务 store 的 action，每个成功改变状态的「最外层动作」沉淀一帧——
+ *       全量状态快照（事件/派发/转移/阻断/抢修/预警/互援/库存）+ 动作元数据 + 当帧新增处置日志。
  * 回放：seek 到任意帧即用快照整体替换当前态势（地图/面板全部响应式联动），
  *       回放期间业务动作一律拦截，演练处于只读锁定状态。
  * 分支：帧按「演练分支」组织为分支树——
@@ -30,6 +31,7 @@ const eventStatusLabel = STATUS_LABEL(EVENT_STATUS)
 const batchStatusLabel = STATUS_LABEL(TRANSFER_STATUS)
 const repairStatusLabel = STATUS_LABEL(REPAIR_STATUS)
 const alertStatusLabel = STATUS_LABEL(ALERT_STATUS)
+const aidStatusLabel = STATUS_LABEL(AID_STATUS)
 const severityLabel = STATUS_LABEL(SEVERITY)
 
 // 不进入复盘时间轴的动作：内部「_」方法、纯 UI 状态、绘图草稿、时钟、自动模拟、场景载入、
@@ -54,6 +56,7 @@ const CATEGORY_META = {
   block:    { label: '道路阻断', color: '#ef5350', icon: '🚧' },
   repair:   { label: '道路抢修', color: '#ffc107', icon: '🔧' },
   warning:  { label: '实时预警', color: '#ff5252', icon: '📡' },
+  aid:      { label: '跨区互援', color: '#7986cb', icon: '🤝' },
   system:   { label: '系统', color: '#78909c', icon: '🎬' }
 }
 
@@ -91,6 +94,10 @@ const ACTION_CATEGORY = {
     confirmAlert: 'warning', confirmAll: 'warning',
     escalateAlert: 'warning', revokeAlert: 'warning', closeAlert: 'warning',
     applySuggestion: 'warning'
+  },
+  aid: {
+    submitRequest: 'aid', reviewRequest: 'aid', rejectRequest: 'aid',
+    executeAid: 'aid', confirmReceipt: 'aid', cancelRequest: 'aid'
   }
 }
 
@@ -119,6 +126,7 @@ function takeSnapshot() {
   const rb = useRoadblockStore()
   const ro = useRepairStore()
   const wn = useWarningStore()
+  const aid = useAidStore()
   // 整体深克隆：帧快照必须与实时状态脱钩，否则后续原地修改会穿透历史帧
   return clone({
     cmd: {
@@ -158,6 +166,9 @@ function takeSnapshot() {
     wn: {
       feeds: wn.feeds,
       alerts: wn.alerts
+    },
+    aid: {
+      requests: aid.requests
     }
   })
 }
@@ -172,6 +183,7 @@ function shelterInSnap(snap, id) { return snap.tr.shelters.find((s) => s.id === 
 function blockInSnap(snap, id) { return snap.rb.blocks.find((b) => b.id === id) }
 function orderInSnap(snap, id) { return snap.ro.orders.find((o) => o.id === id) }
 function alertInSnap(snap, id) { return (snap.wn?.alerts || []).find((a) => a.id === id) }
+function aidReqInSnap(snap, id) { return (snap.aid?.requests || []).find((r) => r.id === id) }
 
 function dispatchName(d) {
   if (!d) return '派发'
@@ -194,6 +206,7 @@ function describeFrame(module, action, args, snap) {
     else if (module === 'rb') title = describeRb(action, args, snap)
     else if (module === 'ro') title = describeRo(action, args, snap)
     else if (module === 'wn') title = describeWn(action, args, snap)
+    else if (module === 'aid') title = describeAid(action, args, snap)
   } catch { /* 标题生成失败不影响录制 */ }
   if (!title) title = action
   return { category, title }
@@ -375,7 +388,32 @@ function describeWn(action, args, snap) {
   }
 }
 
-/* ---------- 当帧新增处置日志（事件时间线 / 阻断日志 / 工单日志 / 预警日志） ---------- */
+function describeAid(action, args, snap) {
+  const req = aidReqInSnap(snap, args[0])
+  const name = req ? `互援请求（${req.teamName} → ${req.eventTitle}）` : '互援请求'
+  switch (action) {
+    case 'submitRequest': {
+      const a = args[0] || {}
+      const team = req?.teamName || a.teamId
+      const ev = evInSnap(snap, a.eventId)
+      const items = (req?.items || []).map((it) => `${RESOURCE_TYPES[it.type]?.label || it.type} ${it.qty}`).join('、')
+      return `外部队伍提交互援请求：${team} 支援「${ev?.title || ''}」（${items}）`
+    }
+    case 'reviewRequest':
+      return `指挥员审核互援配额：${name}`
+    case 'rejectRequest':
+      return `互援请求驳回：${name}`
+    case 'executeAid':
+      return `互援调拨执行、按配额出库：${name}`
+    case 'confirmReceipt':
+      return `接收方确认调拨回执：${name}`
+    case 'cancelRequest':
+      return `互援请求撤销：${name}`
+    default: return ''
+  }
+}
+
+/* ---------- 当帧新增处置日志（事件时间线 / 阻断日志 / 工单日志 / 预警日志 / 互援日志） ---------- */
 
 function collectLogs(next, prev) {
   const logs = []
@@ -398,6 +436,11 @@ function collectLogs(next, prev) {
     const old = prev ? alertInSnap(prev, a.id) : null
     const from = old ? old.log.length : 0
     a.log.slice(from).forEach((t) => logs.push({ source: 'warning', tag: `${severityLabel(a.level)}预警·${a.eventTitle}`, at: t.at, text: t.text }))
+  })
+  ;(next.aid?.requests || []).forEach((r) => {
+    const old = prev ? aidReqInSnap(prev, r.id) : null
+    const from = old ? old.log.length : 0
+    r.log.slice(from).forEach((t) => logs.push({ source: 'aid', tag: `互援·${r.teamName}`, at: t.at, text: t.text }))
   })
   return logs
 }
@@ -550,6 +593,18 @@ function diffSnapshots(prev, next) {
       if (!old.suggestionApplied && a.suggestionApplied) {
         statusChanges.push({ icon: '📦', color: CATEGORY_META.warning.color, text: `${name} 调度建议已联动出库` })
       }
+    }
+  })
+
+  /* 跨区互援请求（旧快照无 aid 字段时按空处理） */
+  ;(next.aid?.requests || []).forEach((r) => {
+    const old = prev ? aidReqInSnap(prev, r.id) : null
+    const name = `互援请求（${r.teamName} → ${r.eventTitle}）`
+    if (!old) {
+      const items = r.items.map((it) => `${RESOURCE_TYPES[it.type]?.label || it.type} ${it.qty}`).join('、')
+      statusChanges.push({ icon: '🤝', color: CATEGORY_META.aid.color, text: `新增互援请求：${r.teamName} 支援「${r.eventTitle}」（${items}）` })
+    } else if (old.status !== r.status) {
+      statusChanges.push({ icon: '🔁', color: CATEGORY_META.aid.color, text: `${name} 状态：${aidStatusLabel(old.status)} → ${aidStatusLabel(r.status)}` })
     }
   })
 
@@ -725,7 +780,15 @@ function summarizeSnapshot(snap) {
     }
   })
 
-  return { events, stock, beds, dispatches, batches, blocks, orders, alerts, settleDay: snap.tr.settleDay }
+  const aids = {}
+  ;(snap.aid?.requests || []).forEach((r) => {
+    aids[r.id] = {
+      id: r.id, name: `${r.teamName} → ${r.eventTitle}`,
+      status: r.status, statusText: aidStatusLabel(r.status)
+    }
+  })
+
+  return { events, stock, beds, dispatches, batches, blocks, orders, alerts, aids, settleDay: snap.tr.settleDay }
 }
 
 // 对照两个快照：按 id 对齐事件/派发/批次/阻断/工单，按基地×物资对齐库存，按安置点对齐床位
@@ -817,10 +880,18 @@ function compareSnapshots(baseSnap, targetSnap) {
     add('实时预警', meta.name, x, y, same, fmt)
   })
 
+  // 跨区互援
+  Object.keys({ ...a.aids, ...b.aids }).forEach((id) => {
+    const x = a.aids[id], y = b.aids[id]
+    const meta = y || x
+    add('跨区互援', meta.name, x?.statusText || '—（无此请求）', y?.statusText || '—（无此请求）',
+      !!x && !!y && x.status === y.status)
+  })
+
   // 结算日
   add('补给结算', '当前结算日', '第' + a.settleDay + '日', '第' + b.settleDay + '日', a.settleDay === b.settleDay)
 
-  const dims = ['事件状态', '基地库存', '安置床位', '物资派发', '转移批次', '道路阻断', '抢修工单', '实时预警', '补给结算']
+  const dims = ['事件状态', '基地库存', '安置床位', '物资派发', '转移批次', '道路阻断', '抢修工单', '实时预警', '跨区互援', '补给结算']
   return {
     rows,
     groups: dims.map((dim) => ({ dim, rows: rows.filter((r) => r.dim === dim) })).filter((g) => g.rows.length),
@@ -865,7 +936,7 @@ function wrapStore(store, module) {
   })
 }
 
-// 在五个业务 store 创建后安装一次（幂等）；main.js 与测试入口调用
+// 在六个业务 store 创建后安装一次（幂等）；main.js 与测试入口调用
 export function installReplayRecorder() {
   const pinia = getActivePinia()
   if (!pinia || pinia.__replayRecorderInstalled) return
@@ -875,6 +946,7 @@ export function installReplayRecorder() {
   wrapStore(useRoadblockStore(), 'rb')
   wrapStore(useRepairStore(), 'ro')
   wrapStore(useWarningStore(), 'wn')
+  wrapStore(useAidStore(), 'aid')
 }
 
 let playTimer = null
@@ -1219,6 +1291,7 @@ export const useReplayStore = defineStore('replay', {
       const rb = useRoadblockStore()
       const ro = useRepairStore()
       const wn = useWarningStore()
+      const aid = useAidStore()
       if (cmd.autoPlay) {
         cmd.autoPlay = false
         clearInterval(cmd.replayTimer)
@@ -1263,6 +1336,10 @@ export const useReplayStore = defineStore('replay', {
       wn.feeds = clone(snap.wn?.feeds || [])
       wn.alerts = clone(snap.wn?.alerts || [])
       wn.focusAlertId = null
+
+      // 旧快照无互援字段时按空态势还原
+      aid.requests = clone(snap.aid?.requests || [])
+      aid.focusRequestId = null
     },
 
     /* ---------- 旧版单线历史兼容 ---------- */
